@@ -1,0 +1,262 @@
+name: ADAC Build Pipeline
+
+on:
+  # workflow_call makes this workflow callable from other workflows
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      run_build:
+        type: boolean
+        default: true
+      run_blackduck:
+        type: boolean
+        default: false
+      run_tests:
+        type: boolean
+        default: false
+      run_sonarqube:
+        type: boolean
+        default: false
+      upload_to_store:
+        type: boolean
+        default: false
+      upload_to_firebase:
+        type: boolean
+        default: false
+      build_apk:
+        type: boolean
+        default: false
+      additional_build_flags:
+        required: false
+        type: string
+        default: ''
+      # for action/checkout@v4, default for action is 1, 0 fetches all
+      # fetching all history may allow creating version code based on commit count
+      checkout_fetch_depth: 
+        required: false
+        type: number
+        default: 1
+
+env:
+  FIREBASE_SERVICE_ACCOUNT_JSON_PATH: ./firebase-service-account.json
+  LOCAL_PROPERTIES_FILE_PATH: ./local.properties
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Set Environment Variables
+        run: |
+          echo "ADAC_GITHUB_REPO_USER=${{ secrets.ADAC_GITHUB_REPO_USER }}" >> "$GITHUB_ENV"
+          echo "ADAC_GITHUB_REPO_TOKEN=${{ secrets.ADAC_GITHUB_REPO_TOKEN }}" >> "$GITHUB_ENV"
+          echo "SONARQUBE_URL=${{ vars.SONARQUBE_HOST_URL }}" >> "$GITHUB_ENV"
+          echo "SONARQUBE_LOGIN=${{ secrets.SONARQUBE_TOKEN }}" >> "$GITHUB_ENV"
+          echo "BITBUCKET_REPO_USER=${{ secrets.BITBUCKET_REPO_USER }}" >> "$GITHUB_ENV"
+          echo "BITBUCKET_REPO_TOKEN=${{ secrets.BITBUCKET_REPO_TOKEN }}" >> "$GITHUB_ENV"
+          echo "MODULE=${{ vars.MODULE }}" >> "$GITHUB_ENV"
+          echo "PRODUCT_FLAVOR=${{ vars.PRODUCT_FLAVOR }}" >> "$GITHUB_ENV"
+          echo "BUILD_TYPE=${{ vars.BUILD_TYPE }}" >> "$GITHUB_ENV"
+          # unfortunately these can't be defined in the env section: https://stackoverflow.com/questions/74825294/github-actions-use-env-variable-on-another-env-variable
+          echo "KEYSTORE_FOLDER_PATH=${{ runner.temp }}/keystore" >> "$GITHUB_ENV"
+          echo "KEYSTORE_FILE_PATH=${{ runner.temp }}/keystore/keystore.jks" >> "$GITHUB_ENV"
+      # this is necessary because of: https://stackoverflow.com/questions/71590851
+      - name: Setup Swap
+        run: |
+          sudo swapoff -a
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo swapon --show
+      - name: Checkout Sources
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+          token: ${{ secrets.ADAC_GITHUB_REPO_TOKEN }}
+          fetch-depth: ${{ inputs.checkout_fetch_depth }}
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          cache: 'gradle'
+          # blackduck needs jdk 11: https://github.com/synopsys-sig/detect-action?tab=readme-ov-file#set-up-java
+          java-version: |
+            11
+            17
+      # this reads & decodes the encoded keystore from the repository secrets
+      - name: Setup Keystore
+        if: ${{ inputs.upload_to_firebase == true || inputs.upload_to_store == true }}
+        run: |
+          mkdir $KEYSTORE_FOLDER_PATH
+          echo "${{ secrets.KEYSTORE }}" | base64 -di > $KEYSTORE_FILE_PATH
+      - name: Setup Gradle
+        with:
+          # do not validate wrappers for now as this seems to fail consistently
+          validate-wrappers: false
+        uses: gradle/actions/setup-gradle@v4
+      - name: Setup Prebuilt Couchbase Database
+        if: ${{ inputs.run_build == true }}
+        run: ./gradlew :${MODULE}:replacePrebuildDb -Dendpoint_config=${{ vars.ENDPOINT_CONFIG }}
+      - name: Build App
+        id: build
+        if: ${{ inputs.run_build == true || inputs.run_sonarqube == true }}
+        run: |
+          # use proper build command depending on build_apk flag
+          BUILD_COMMAND=$(${{ inputs.build_apk == true }} && echo "assemble" || echo "bundle")
+          ./gradlew :${MODULE}:${BUILD_COMMAND}${PRODUCT_FLAVOR^}${BUILD_TYPE^} -Dendpoint_config=${{ vars.ENDPOINT_CONFIG }} --stacktrace ${{ inputs.additional_build_flags}}
+      # bundletool is needed to extract the version of the built aab file
+      - name: Install Bundletool
+        if: ${{ inputs.build_apk == false }}
+        run: |
+          JSON=$(curl --fail-with-body -s https://api.github.com/repos/google/bundletool/releases/latest)
+          BUNDLE_TOOL_DOWNLOAD_URL=$(echo $JSON | jq -r ".assets | .[].browser_download_url")
+          curl $BUNDLE_TOOL_DOWNLOAD_URL -4 -sL -o 'bundletool.jar'
+          java -jar bundletool.jar version
+      - name: Set Build Environment Variables
+        if: steps.build.outcome == 'success'
+        run: |
+          BUILD_TOOLS_VERSION=$(ls -1v $ANDROID_HOME/build-tools | tail -1)
+
+          # apks use separate subfolders for the build type, while bundles don't
+          # e.g. apk/clientPreviewIntg/release/*.apk vs bundle/clientPreviewIntgRelease/*.aab
+          APK_PRODUCT_FLAVOR_PATH=$([ ! -z "${PRODUCT_FLAVOR}" ] && echo "$PRODUCT_FLAVOR/" || echo "")
+          APK_BUILD_TYPE_PATH=$([ ! -z "${BUILD_TYPE}" ] && echo "$BUILD_TYPE/" || echo "")
+          AAB_BUILD_TYPE_PATH=$([ ! -z "${PRODUCT_FLAVOR}" ] && echo "${BUILD_TYPE^}/" || echo "${BUILD_TYPE}/")
+
+          BUILD_TOOLS_PATH=$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION
+
+          APK_PATH=./${MODULE}/build/outputs/apk/${APK_PRODUCT_FLAVOR_PATH}${APK_BUILD_TYPE_PATH}*.apk
+          AAB_PATH=./${MODULE}/build/outputs/bundle/${PRODUCT_FLAVOR}${AAB_BUILD_TYPE_PATH}*.aab
+          APP_PATH=$(${{ inputs.build_apk == true }} && echo $APK_PATH || echo $AAB_PATH)
+
+          APK_VERSION=$($BUILD_TOOLS_PATH/aapt dump badging ${APK_PATH} | grep "versionName" | sed -e "s/.*versionName='//" -e "s/' .*//") || $(echo "")
+          AAB_VERSION=$(java -jar bundletool.jar dump manifest --bundle $AAB_PATH --xpath /manifest/@android:versionName) || $(echo "")
+          VERSION_NAME=$(${{ inputs.build_apk == true }} && echo $APK_VERSION || echo $AAB_VERSION )
+
+          APK_PACKAGE_NAME=$($BUILD_TOOLS_PATH/aapt dump badging ${APK_PATH} | grep package:\ name) || $(echo "")
+          AAB_PACKAGE_NAME=$(java -jar bundletool.jar dump manifest --bundle $AAB_PATH --xpath /manifest/@package) || $(echo "")
+          PACKAGE_NAME=$(${{ inputs.build_apk == true }} && echo $APK_PACKAGE_NAME || echo $AAB_PACKAGE_NAME )
+
+          # log outputs for debug
+          echo "BUILD TOOLS VERSION: $BUILD_TOOLS_VERSION"
+          echo "BUILD TOOLS PATH: $BUILD_TOOLS_PATH"
+          echo "APP PATH: $APP_PATH"
+          echo "VERSION NAME: $VERSION_NAME"
+
+          # make environment variables reusable in other steps
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo "BUILD_TOOLS_PATH=$BUILD_TOOLS_PATH" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> "$GITHUB_ENV"
+      - name: Setup Black Duck
+        if: ${{ inputs.run_blackduck == true }}
+        run: |
+          # getting newest build tools version
+          echo "detect.project.name = ${{ vars.BLACKDUCK_PROJECT }}" >> ./application.properties
+          echo "detect.project.version.name = $VERSION_NAME" >> ./application.properties
+      - name: Run Black Duck
+        if: ${{ inputs.run_blackduck == true }}
+        uses: synopsys-sig/detect-action@v0.3.4
+        with:
+          scan-mode: INTELLIGENT
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          detect-version: 7.9.0
+          blackduck-url: ${{ vars.BLACKDUCK_HOST_URL }}
+          blackduck-api-token: ${{ secrets.BLACKDUCK_TOKEN }}
+      - name: Run Tests
+        if: ${{ inputs.run_tests == true || inputs.run_sonarqube == true }}
+        run: |
+          # running the normal test command here without module to guarantee all
+          # tests are actually called
+          ./gradlew test --stacktrace
+          ./gradlew jacocoTestReport --stacktrace
+      # this was using the official sonarqube github action
+      # but the gradle plugin is supposed to be more accurate
+      #- name: Run Sonarqube
+      #  if: ${{ inputs.run_sonarqube == true }}
+      #  uses: sonarsource/sonarqube-scan-action@v3.0.0
+      #  env:
+      #    SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+      #    SONAR_HOST_URL: ${{ vars.SONARQUBE_HOST_URL }}
+      #  with:
+      #    args: >-
+      #      -Dsonar.projectKey=${{ vars.SONARQUBE_PROJECT_KEY }}
+      - name: Run Sonarqube
+        if: ${{ inputs.run_sonarqube == true }}
+        run: |
+          SONAR_PROPERTIES_FILE_PATH="./${MODULE}/sonar.properties"
+          echo "sonarqube_project_key=${{ vars.SONARQUBE_PROJECT_KEY }}" >> "$SONAR_PROPERTIES_FILE_PATH"
+          echo "sonarqube_project_name=${{ vars.SONARQUBE_PROJECT_NAME }}" >> "$SONAR_PROPERTIES_FILE_PATH"
+          echo "sonarqube_url=${{ vars.SONARQUBE_HOST_URL }}" >> ${{ env.LOCAL_PROPERTIES_FILE_PATH }}
+          echo "sonarqube_login=${{ secrets.SONARQUBE_TOKEN }}" >> ${{ env.LOCAL_PROPERTIES_FILE_PATH }}
+          ./gradlew :${MODULE}:sonarqube --stacktrace
+      - name: Sign App Bundle
+        if: ${{ inputs.build_apk == false && (inputs.upload_to_firebase == true || inputs.upload_to_store == true) }}
+        run: |
+          jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 -keystore $KEYSTORE_FILE_PATH $APP_PATH '${{ secrets.KEYSTORE_KEY_ALIAS }}' --storepass '${{ secrets.KEYSTORE_PASSWORD }}' --keypass '${{ secrets.KEYSTORE_KEY_PASSWORD }}'
+      - name: Sign APK
+        if: ${{ inputs.build_apk == true && (inputs.upload_to_firebase == true || inputs.upload_to_store == true) }}
+        run: |
+          $BUILD_TOOLS_PATH/apksigner sign --ks $KEYSTORE_FILE_PATH --ks-pass 'pass:${{ secrets.KEYSTORE_PASSWORD }}' --ks-key-alias '${{ secrets.KEYSTORE_KEY_ALIAS }}' --key-pass 'pass:${{ secrets.KEYSTORE_KEY_PASSWORD }}' $APP_PATH
+      - name: Setup Firebase App Distribution
+        id: setup-firebase
+        if: ${{ inputs.upload_to_firebase == true }}
+        run: |
+          npm install -g firebase-tools
+          echo $(echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}' | base64 -di | jq -c) > ${{ env.FIREBASE_SERVICE_ACCOUNT_JSON_PATH }}
+          echo "GOOGLE_APPLICATION_CREDENTIALS=${{ env.FIREBASE_SERVICE_ACCOUNT_JSON_PATH }}" >> "$GITHUB_ENV"
+      - name: Upload To Firebase App Distribution
+        if: ${{ inputs.upload_to_firebase == true }}
+        run: |
+          # in case this step fails and you were building an app bundle,
+          # you should make sure that your firebase project is linked with google play:
+          # https://support.google.com/firebase/answer/6392038
+          firebase appdistribution:distribute $APP_PATH --app ${{ vars.FIREBASE_APP_ID }}
+      - name: Setup Play Store Upload
+        id: setup-playstore-upload
+        if: ${{ inputs.upload_to_store == true }}
+        run: |
+          GOOGLE_SERVICE_JSON=$(echo '${{ secrets.PLAY_STORE_UPLOAD_SERVICE_ACCOUNT_JSON }}' | base64 -di | jq -c)
+          # this is needed as we can neither use a file nor a command (for base64 decoding) inside
+          # the inputs of the google auth action. therefore we have to save the decoded json as output
+          # of this step to simply read it in the next.
+          echo "google_service_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$GOOGLE_SERVICE_JSON" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Setup Google Cloud Authentication
+        id: gcloud-authentication
+        if: ${{ inputs.upload_to_store == true }}
+        uses: google-github-actions/auth@v2
+        with:
+          service_account: github@api-github-upload.iam.gserviceaccount.com
+          credentials_json: ${{ steps.setup-playstore-upload.outputs.google_service_json }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/androidpublisher	
+      - name: Upload To Google Play Store
+        if: ${{ inputs.upload_to_store == true }}
+        run: |
+          ACCESS_TOKEN=${{ steps.gcloud-authentication.outputs.access_token }}
+          # need to setup a new edit to be able to upload the app
+          echo "creating new edit through the playstore api"
+          EDIT_ID=$(curl --fail-with-body -X POST -H "Authorization: Bearer $ACCESS_TOKEN" https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$PACKAGE_NAME/edits | jq -r '.id')
+          
+          # actual upload
+          echo "uploading app to playstore"
+          UPLOAD_URL=$(${{ inputs.build_apk == true }} && echo "https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/$PACKAGE_NAME/edits/$EDIT_ID/apks" || echo "https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/$PACKAGE_NAME/edits/$EDIT_ID/bundles")
+          MIME_TYPE=$(${{ inputs.build_apk == true }} && echo "application/vnd.android.package-archive" || echo "application/octet-stream")
+          curl --fail-with-body -X POST -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: $MIME_TYPE" --data-binary @$APP_PATH $UPLOAD_URL
+
+          # finalization
+          echo "committing the pending edit"
+          curl --fail-with-body -X POST -H "Authorization: Bearer $ACCESS_TOKEN" "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$PACKAGE_NAME/edits/$EDIT_ID:commit"
+      - name: Clean Up
+        if: always()
+        run: |
+          rm -f ${{ env.FIREBASE_SERVICE_ACCOUNT_JSON_PATH }}
+          rm -f ${{ env.LOCAL_PROPERTIES_FILE_PATH }}
+          rm -f $KEYSTORE_FILE_PATH
+          rm -f ./bundletool.jar

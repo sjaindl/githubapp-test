@@ -1,2 +1,4 @@
-# githubapp-test
-github app test project
+# github-auth-test
+Repository for testing github app authentication
+
+
