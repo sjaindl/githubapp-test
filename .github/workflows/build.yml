@@ -28,11 +28,11 @@ jobs:
       # Use the authenticated token
       - name: Use authenticated token
         env:
-          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
         run: |
           echo "Authenticated as a GitHub App"
           # Example: List branches in the repository
-          gh api repos/:owner/:repo/branches --header "Authorization: token $GITHUB_TOKEN"
+          gh api repos/:owner/:repo/branches --header "Authorization: token GH_TOKEN"
 
       - name: Checkout code
         uses: actions/checkout@v3
