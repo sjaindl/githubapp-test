@@ -12,6 +12,9 @@ on:
     branches:
       - main # Trigger on pull requests targeting the main branch
 
+env:
+  GH_TOKEN: ${{ github.token }}
+
 jobs:
   build:
     name: Build and Test Android App
