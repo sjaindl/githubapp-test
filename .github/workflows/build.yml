@@ -45,6 +45,18 @@ jobs:
           # Make sure the value of GITHUB_TOKEN will not be persisted in repo's config
           persist-credentials: false
 
+      - name: Debug GitHub App Token Permissions
+        run: |
+          curl -H "Authorization: Bearer ${{ steps.app-token.outputs.token }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                https://api.github.com/user
+
+      - name: List GitHub App Token Scopes
+        run: |
+          curl -H "Authorization: Bearer ${{ steps.app-token.outputs.token }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                https://api.github.com/installation/repositories
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
